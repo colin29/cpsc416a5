@@ -49,6 +49,8 @@ type CrawlRes struct {
 	WorkerIP string // workerIP
 }
 
+var crawlWg sync.WaitGroup //tracks number of recursive crawl requests to seperate domains that still need to be sent out/finished by the server
+
 func (t *MServer) Crawl(req *CrawlReq, reply *CrawlRes) error {
 
 	workersMutex.Lock()
@@ -59,8 +61,10 @@ func (t *MServer) Crawl(req *CrawlReq, reply *CrawlRes) error {
 	workersMutex.Unlock()
 
 	//Let the crawling begin;
+	reply.WorkerIP = crawl(req.URL, req.Depth)
 
-	reply.WorkerIP = crawl(req.URL)
+	crawlWg.Wait()
+	fmt.Println("Crawl Request completed")
 	return nil
 }
 
@@ -94,7 +98,7 @@ func (t *MServer) Overlap(req *OverlapReq, reply *OverlapRes) error {
 /*
 List of functions:
 RegisterWorker
-WhoOwnsThisDomain
+CrawlFurther
 */
 
 type WMaster int
@@ -113,17 +117,26 @@ func (t *WMaster) RegisterWorker(req *WRegisterWorkerReq, reply *Void) error {
 	return nil
 }
 
-type WhoOwnsThisDomainReq struct {
+type CrawlFurtherReq struct {
 	Domain string
+	URL    string
+	Depth  int // new depth
 }
 
-func (t *WMaster) WhoOwnsThisDomain(req *WhoOwnsThisDomainReq, reply *string) error {
+func (t *WMaster) CrawlFurther(req *CrawlFurtherReq, reply *Void) error {
 
-	fmt.Println("Got RPC Request: ", req.Domain, " {WhoOwnsThisDomain}")
-	domainOwner := lookupDomain(req.Domain)
+	fmt.Println("Got RPC Request: ", req.Domain, " {CrawlFurther}")
 
-	*reply = domainOwner
+	//start a new go-routine and continue this crawl
+	crawlWg.Add(1)
+	go crawlFurther(req.Domain, req.URL, req.Depth)
+
 	return nil
+}
+
+func crawlFurther(domain string, url string, depth int) {
+	defer crawlWg.Done()
+	crawl(url, depth)
 }
 
 /////////////* Implementation of worker-related functions*//////////////
@@ -135,7 +148,7 @@ func doOnWorkerJoin(workerIpPort string) {
 }
 
 //returns the worker who owns the domain of the url given
-func crawl(url string) string {
+func crawl(url string, depth int) string {
 
 	var worker string
 
@@ -147,12 +160,13 @@ func crawl(url string) string {
 	client := rpc.NewClient(conn)
 	crawlReq := &StoreAndCrawlReq{}
 	crawlReq.Urls = []string{url}
-	crawlReq.Depth = 2
+	crawlReq.Depth = depth
 
 	err := client.Call("WWorker.StoreAndCrawl", &crawlReq, &void)
 	checkF(err)
 	conn.Close()
 
+	fmt.Println("A crawl chain of: ", url, " finished.")
 	return worker
 }
 
@@ -300,17 +314,14 @@ func measureWebSite(workerIpPort string, req *WWebsiteReq, results map[string]La
 
 	defer wg.Done()
 
-	log.Println("setting up with worker")
 	conn := setupTCPConn(workerIpPort)
-	log.Println("setting up with worker")
 	//Make RPC call
 	ls := LatencyStats{}
 	client := rpc.NewClient(conn)
-	log.Println("setting up with worker ", workerIpPort)
 	err := client.Call("WWorker.MeasureWebsiteLatency", &req, &ls)
 	checkF(err)
 	conn.Close()
-	log.Println("A worker finished a measurment:", ls)
+	log.Println("Worker {", workerIpPort, "} finished measuring:", ls)
 
 	resultsMutex.Lock()
 	results[workerIpPort] = ls

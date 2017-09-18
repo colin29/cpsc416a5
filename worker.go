@@ -130,12 +130,7 @@ func storeAndCrawl(urls []string, depth int) {
 				if haveit {
 					storeAndCrawl([]string{linkUrl}, depth-1) //store and crawl accepts a slice
 				} else {
-					owner := askServerWhoOwnsDomain(domain)
-					if owner == myID {
-						storeAndCrawl([]string{linkUrl}, depth-1) //store and crawl accepts a slice
-					} else {
-						fmt.Printf("Unimplemented: Recursive Crawling, but I don't have the domain [%v]\n", url)
-					}
+					askServerToCrawlFurther(linkUrl, domain, depth-1)
 				}
 			}
 
@@ -152,7 +147,7 @@ func storeAndCrawl(urls []string, depth int) {
 
 }
 
-//Checks locally, to be 100% sure you need to check the server afterwards; however, this checking is still useful;
+//Checks locally to see if this worker owns that domain
 //Callee Locking
 func doIHaveDomain(domain string) bool {
 	domainsOwnedMutex.Lock()
@@ -217,26 +212,21 @@ func main() {
 
 }
 
-//returns: the identifer of the worker that owns the domain
+//returns: nothing
 //Callee Locking
-func askServerWhoOwnsDomain(domain string) string {
+func askServerToCrawlFurther(url string, domain string, depth int) {
 	conn := setupTCPConn(serverIpPort)
 	client := rpc.NewClient(conn)
-	req := &WhoOwnsThisDomainReq{}
+	req := &CrawlFurtherReq{}
+	req.URL = url
 	req.Domain = domain
-	res := ""
+	req.Depth = depth
 
-	fmt.Println("Calling server WhoOwnsThisDomain: ", domain, "  ", serverIpPort)
-	err := client.Call("WMaster.WhoOwnsThisDomain", &req, &res)
+	fmt.Println("Calling server CrawlFurther: ", domain, "  ", serverIpPort)
+	err := client.Call("WMaster.CrawlFurther", &req, &void)
 	checkF(err)
 	conn.Close()
-	fmt.Printf("Domain %v owned by worker %v\n", domain, res)
-	if res == myID { //cache the domain so we don't have to ask the server every time
-		domainsOwnedMutex.Lock()
-		domainsOwned[domain] = true //value doesn't matter
-		domainsOwnedMutex.Unlock()
-	}
-	return res
+	fmt.Printf("Request sent")
 }
 
 type pageInfo struct {
@@ -352,8 +342,10 @@ type WRegisterWorkerReq struct {
 	WorkerIp string
 }
 
-type WhoOwnsThisDomainReq struct {
+type CrawlFurtherReq struct {
 	Domain string
+	URL    string
+	Depth  int // new depth
 }
 
 //RPC Setup
