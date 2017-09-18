@@ -54,11 +54,6 @@ func (t *WWorker) AddDomain(req *AddDomainReq, reply *Void) error {
 	return nil
 }
 
-type StoreAndCrawlReq struct {
-	Urls  []string //should be absolute, canonical addresses
-	Depth int
-}
-
 /////////////*RPC Service for the Server*/////////////
 
 /*
@@ -67,6 +62,11 @@ MeasureWebsiteLatency
 AddDomain
 StoreAndCrawl
 */
+
+type StoreAndCrawlReq struct {
+	Urls  []string //should be absolute, canonical addresses
+	Depth int
+}
 
 //Input: Req with a list of urls and a crawl depth
 //Effects: Tells the worker to store nodes of these urls, and then crawl and populate the fields of those nodes.
@@ -77,6 +77,167 @@ func (t *WWorker) StoreAndCrawl(req *StoreAndCrawlReq, reply *Void) error {
 
 	printGraph(nodes)
 	return nil
+}
+
+type CaculateOverlapReq struct {
+	Url1    string
+	Url2    string
+	Worker2 string
+}
+
+func (t *WWorker) CalculateOverlap(req *CaculateOverlapReq, reply *int) error {
+	fmt.Println("Recieved CaculateOverlap Request")
+
+	//Step 1: calculate the list of accessible urls within this domain, starting from url1
+
+	accessiblePages, err := getAccessiblePages(req.Url1)
+	Use(accessiblePages, err)
+	if err != nil {
+		return err
+	}
+	fmt.Println(accessiblePages)
+
+	//Step 2: call the required worker2 to do one direction of the overlap calculations.
+
+	if req.Worker2 == myID {
+		fmt.Println("Case where one worker owns both domains")
+
+		accessiblePages2, err := getAccessiblePages(req.Url2)
+		subTotal, err := calculateOneWayOverlap(accessiblePages2, accessiblePages)
+		if err != nil {
+			return err
+		}
+		subTotal2, err := calculateOneWayOverlap(accessiblePages, accessiblePages2)
+		if err != nil {
+			return err
+		}
+		*reply = subTotal + subTotal2
+		fmt.Println("Finished Overlap Request")
+		return nil
+	}
+
+	fmt.Println("sending request to other worker")
+	conn := setupTCPConn(req.Worker2)
+
+	client := rpc.NewClient(conn)
+
+	r := CalculateOverlapHelperReq{}
+	r.AccessiblePagesUrl1 = accessiblePages
+	r.Url2 = req.Url2
+
+	ans := CalculateOverlapHelperRes{}
+
+	err = client.Call("WWorker.CalculateOverlapHelper", &r, &ans)
+	checkF(err)
+	conn.Close()
+
+	//Step 3: use the information to do the calculation of the other direction
+
+	fmt.Println("Calculating second half of overlap")
+	subTotal, err := calculateOneWayOverlap(accessiblePages, ans.AccessiblePagesUrl2)
+	if err != nil {
+		return err
+	}
+
+	//Combine results
+	*reply = ans.SubTotal + subTotal
+
+	fmt.Println("Finished Overlap Request")
+
+	return nil
+}
+
+type CalculateOverlapHelperReq struct {
+	AccessiblePagesUrl1 []string
+	Url2                string
+}
+
+type CalculateOverlapHelperRes struct {
+	AccessiblePagesUrl2 []string
+	SubTotal            int
+}
+
+func (t *WWorker) CalculateOverlapHelper(req *CalculateOverlapHelperReq, reply *CalculateOverlapHelperRes) error {
+	domain := getDomain(req.Url2)
+	pages := make([]string, 0)
+
+	nodesMutex.Lock()
+	err := getPagesHelper(req.Url2, &pages, domain)
+	check(err)
+	nodesMutex.Unlock()
+
+	(*reply).AccessiblePagesUrl2 = pages
+
+	//Todo: calculate overlap one-way from D2 -> D1
+	subTotal, err := calculateOneWayOverlap(pages, req.AccessiblePagesUrl1)
+	if err != nil {
+		return err
+	}
+	reply.SubTotal = subTotal
+
+	return nil
+}
+
+//Returns a list of pages accessibe from the given url, within the same domain.
+func getAccessiblePages(url string) (pages []string, err error) {
+	domain := getDomain(url)
+
+	pages = make([]string, 0)
+
+	nodesMutex.Lock()
+	err = getPagesHelper(url, &pages, domain)
+	check(err)
+	nodesMutex.Unlock()
+	return
+}
+
+//depth first flood-fill
+func getPagesHelper(url string, pages *[]string, domain string) error {
+	*pages = append(*pages, url)
+	node, ok := nodes[url]
+	if !ok {
+		return errors.New("Url: " + url + " doesn't have a node for it")
+	}
+
+	for _, linkUrl := range node.childNodes {
+		fmt.Println("link:  ", linkUrl)
+		if getDomain(linkUrl) != domain {
+			fmt.Println("External link, skipping.")
+			continue
+		}
+		if !contains(*pages, linkUrl) {
+			err := getPagesHelper(linkUrl, pages, domain)
+			if err != nil {
+				return err
+			}
+		} else {
+			fmt.Println("Already visited node: ", linkUrl)
+			continue
+		}
+	}
+	return nil
+}
+
+//Callee locking
+func calculateOneWayOverlap(accessiblePages []string, pagesFromOtherDomain []string) (int, error) {
+	total := 0
+	nodesMutex.Lock()
+	for _, url := range accessiblePages {
+		node, ok := nodes[url]
+		if !ok {
+			return -1, errors.New("Error: supposedly accessible page " + url + " is not in crawl-store.")
+			continue
+		}
+		for _, linkUrl := range node.childNodes {
+			if contains(pagesFromOtherDomain, linkUrl) {
+				total += 1
+				fmt.Println("+1 overlap")
+			}
+		}
+
+	}
+	nodesMutex.Unlock()
+	return total, nil
 }
 
 //Local version of StoreAndCrawl
@@ -112,6 +273,10 @@ func storeAndCrawl(urls []string, depth int) {
 		nodes[url] = node
 		nodesMutex.Unlock()
 
+		if depth == 0 {
+			return //if the depth is zero, we just leave create an empty node for that url, we don't inspect the page or add any more edges
+		}
+
 		//Crawl the url
 		pageInfo := crawlPage(url)
 		node.childNodes = pageInfo.urlLinks
@@ -121,7 +286,7 @@ func storeAndCrawl(urls []string, depth int) {
 		nodes[url] = node
 		nodesMutex.Unlock()
 
-		if depth > 1 {
+		if depth > 0 {
 			for _, linkUrl := range node.childNodes {
 
 				domain := getDomain(linkUrl)
@@ -596,6 +761,15 @@ func canonicalizePath(path string) (string, error) {
 }
 
 ///////////* Utility functions (non-project specific) *////////////
+
+func contains(s []string, e string) bool {
+	for _, a := range s {
+		if a == e {
+			return true
+		}
+	}
+	return false
+}
 
 func check(err error) {
 	if err != nil {

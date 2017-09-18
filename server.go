@@ -76,7 +76,17 @@ type DomainsRes struct {
 	Domains []string // List of domain string
 }
 
+//Different from the assignment, my Domains RPC accepts ip:port instead of just ip to identify the worker (this is needed because all my workers are running on a single local machine)
 func (t *MServer) Domains(req *DomainsReq, reply *DomainsRes) error {
+
+	domainOwnerMutex.Lock()
+	for domain, worker := range domainOwner {
+		if req.WorkerIP == worker {
+			reply.Domains = append(reply.Domains, domain)
+		}
+	}
+	domainOwnerMutex.Unlock()
+
 	return nil
 }
 
@@ -89,7 +99,43 @@ type OverlapRes struct {
 	NumPages int // Computed overlap between two URLs
 }
 
+type CaculateOverlapReq struct {
+	Url1    string
+	Url2    string
+	Worker2 string
+}
+
 func (t *MServer) Overlap(req *OverlapReq, reply *OverlapRes) error {
+	fmt.Println("Recieved Overlap Request")
+	domainOwnerMutex.Lock()
+	worker1 := domainOwner[getDomain(req.URL1)]
+	worker2 := domainOwner[getDomain(req.URL2)]
+	domainOwnerMutex.Unlock()
+	if worker1 == "" {
+		return errors.New("url1 isn't owned by a worker")
+	}
+	if worker2 == "" {
+		return errors.New("url2 isn't owned by a worker")
+	}
+
+	r := CaculateOverlapReq{}
+	r.Url1 = req.URL1
+	r.Url2 = req.URL2
+	r.Worker2 = worker2
+
+	//Tell that worker that it now owns that domain.
+	conn := setupTCPConn(worker1)
+
+	client := rpc.NewClient(conn)
+
+	var overlapResult int
+
+	err := client.Call("WWorker.CalculateOverlap", &r, &overlapResult)
+	checkF(err)
+	conn.Close()
+
+	reply.NumPages = overlapResult
+	fmt.Println("Overlap Request Finished")
 	return nil
 }
 
